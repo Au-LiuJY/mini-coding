@@ -116,7 +116,12 @@ def _is_read_only_command(command: str) -> bool:
 
 
 def _looks_like_shell_snippet(command: str, args: list[str]) -> bool:
-    return not args and any(char in command for char in "|&;<>()$`")
+    if args:
+        return False
+    shell_metachars = "|&;<>()$`"
+    if os.name == "nt":
+        shell_metachars = "|&<>()$`"
+    return any(char in command for char in shell_metachars)
 
 
 def _is_background_shell_snippet(command: str, args: list[str]) -> bool:
@@ -183,6 +188,55 @@ def _is_windows_shell_builtin(command: str) -> bool:
     }
 
 
+def _rewrite_windows_shell_snippet(shell_command: str) -> tuple[str, bool]:
+    original = shell_command
+    command = shell_command
+
+    def _head_repl(match: re.Match) -> str:
+        value = match.group("n")
+        n = int(value) if value else 10
+        return f"| Select-Object -First {n}"
+
+    def _tail_repl(match: re.Match) -> str:
+        value = match.group("n")
+        n = int(value) if value else 10
+        return f"| Select-Object -Last {n}"
+
+    command = re.sub(r"\|\s*head(?:\s+-n\s+(?P<n>\d+))?\s*(?:$|\|)", _head_repl, command)
+    command = re.sub(r"\|\s*tail(?:\s+-n\s+(?P<n>\d+))?\s*(?:$|\|)", _tail_repl, command)
+    return command, command != original
+
+
+def _convert_windows_head_tail(command: str, args: Sequence[str]) -> tuple[str, list[str]] | None:
+    lowered = command.lower()
+    if os.name != "nt" or lowered not in {"head", "tail"}:
+        return None
+
+    count = 10
+    file_path: str | None = None
+
+    if args:
+        if len(args) >= 2 and args[0] == "-n" and str(args[1]).isdigit():
+            count = int(args[1])
+            file_path = args[2] if len(args) >= 3 else None
+        elif args[0].startswith("-") and args[0][1:].isdigit():
+            count = int(args[0][1:])
+            file_path = args[1] if len(args) >= 2 else None
+        else:
+            file_path = args[0]
+
+    if not file_path:
+        return None
+
+    if lowered == "head":
+        ps = f"Get-Content -Path {shlex.quote(file_path)} -TotalCount {count}"
+    else:
+        ps = f"Get-Content -Path {shlex.quote(file_path)} -Tail {count}"
+
+    return "powershell", ["-NoProfile", "-Command", ps]
+
+
+
 def _build_execution_command(
     raw_command: str,
     normalized_command: str,
@@ -194,11 +248,17 @@ def _build_execution_command(
     if use_shell:
         shell_command = _strip_trailing_background_operator(raw_command) if background_shell else raw_command
         if os.name == "nt":
+            rewritten, changed = _rewrite_windows_shell_snippet(shell_command)
+            if changed:
+                return "powershell", ["-NoProfile", "-Command", rewritten]
             return "cmd", ["/d", "/s", "/c", shell_command]
         # Use the user's preferred shell (macOS defaults to zsh since
         # Catalina).  Fall back to /bin/sh for maximum POSIX compatibility.
         shell = os.environ.get("SHELL", "/bin/sh")
         return shell, ["-lc", shell_command]
+    converted = _convert_windows_head_tail(normalized_command, normalized_args)
+    if converted is not None:
+        return converted
     if _is_windows_shell_builtin(normalized_command):
         quoted_args = subprocess.list2cmdline(list(normalized_args))
         shell_command = normalized_command if not quoted_args else f"{normalized_command} {quoted_args}"

@@ -53,9 +53,13 @@ def _run_git(args: list[str], cwd: str) -> tuple[int, str, str]:
         cwd=cwd,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
     )
-    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    return proc.returncode, stdout, stderr
 
 
 def _run_status(cwd: str) -> ToolResult:

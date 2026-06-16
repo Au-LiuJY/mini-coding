@@ -233,17 +233,24 @@ class AnthropicModelAdapter:
                 if store:
                     store.set_state(record_api_error())
                 raise RuntimeError(_extract_error_message(data, status))
-    
-            # Update store with API call success and cost tracking
+
+            usage = data.get("usage", {})
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            cache_read_tokens = usage.get("cache_read_input_tokens", 0)
+            cache_creation_tokens = usage.get("cache_creation_input_tokens", 0)
+
+            if input_tokens > 0:
+                try:
+                    from minicode.context_manager import estimate_messages_tokens, record_token_estimation_sample
+                    estimated_input = estimate_messages_tokens(messages)
+                    record_token_estimation_sample(self.runtime["model"], estimated_input, int(input_tokens))
+                except Exception:
+                    pass
+
             if store:
                 # Calculate token usage and cost (with cache support)
                 from minicode.cost_tracker import calculate_cost
-                usage = data.get("usage", {})
-                input_tokens = usage.get("input_tokens", 0)
-                output_tokens = usage.get("output_tokens", 0)
-                cache_read_tokens = usage.get("cache_read_input_tokens", 0)
-                cache_creation_tokens = usage.get("cache_creation_input_tokens", 0)
-                
                 cost_usd = calculate_cost(
                     model=self.runtime["model"],
                     input_tokens=input_tokens,
@@ -253,10 +260,7 @@ class AnthropicModelAdapter:
                 )
                 if cost_usd > 0:
                     store.set_state(add_cost(cost_usd))
-                
-                # Update context usage
-                total_tokens = input_tokens + output_tokens
-                store.set_state(update_context_usage(total_tokens))
+                store.set_state(update_context_usage(input_tokens + output_tokens))
     
             tool_calls: list[dict[str, Any]] = []
             text_parts: list[str] = []

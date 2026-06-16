@@ -5,7 +5,7 @@ import inspect
 import time
 from typing import Any, Callable
 
-from minicode.context_manager import ContextManager, estimate_message_tokens
+from minicode.context_manager import ContextManager, estimate_message_tokens, apply_token_estimation_multiplier
 from minicode.logging_config import get_logger
 from minicode.permissions import PermissionManager
 from minicode.state import Store, AppState, increment_tool_calls, set_busy, set_idle
@@ -63,7 +63,7 @@ from minicode.memory import MemoryManager
 
 logger = get_logger("agent_loop")
 
-# 甯搁噺锛氶伩鍏嶉噸澶嶇殑鎻愮ず鏂囨湰
+
 NUDGE_CONTINUE = (
     "Continue immediately from your <progress> update with concrete tool calls, "
     "code changes, or an explicit <final> answer only if the task is complete. "
@@ -709,16 +709,37 @@ def run_agent_turn(
                 except Exception:
                     pass
             # 执行实际记忆注入：将相关记忆注入到系统 prompt 中
+            current_files: list[str] | None = None
+            try:
+                seen: set[str] = set()
+                extracted: list[str] = []
+                for m in reversed(current_messages[-80:]):
+                    if m.get("role") != "assistant_tool_call":
+                        continue
+                    inp = m.get("input")
+                    if not isinstance(inp, dict):
+                        continue
+                    p = inp.get("path") or inp.get("filePath")
+                    if isinstance(p, str) and p.strip():
+                        key = p.strip()
+                        if key not in seen:
+                            seen.add(key)
+                            extracted.append(key)
+                    if len(extracted) >= 12:
+                        break
+                current_files = extracted if extracted else None
+            except Exception:
+                current_files = None
             if orch and task:
                 try:
                     task_desc = task.raw_input if hasattr(task, 'raw_input') else ""
-                    current_messages = orch.inject_memories(task_desc, current_messages)
+                    current_messages = orch.inject_memories(task_desc, current_messages, current_files=current_files)
                 except Exception:
                     pass
             elif memory_injector and task:
                 try:
                     task_desc = task.raw_input if hasattr(task, 'raw_input') else ""
-                    injected = memory_injector.inject_for_task(task_desc)
+                    injected = memory_injector.inject_for_task(task_desc, current_files=current_files)
                     if injected:
                         logger.info(
                             "MemoryInjector: injected %d memories (mode=%s)",
@@ -742,7 +763,10 @@ def run_agent_turn(
                 context_window=context_manager.context_window,
                 workspace=cwd,
                 memory_manager=memory_mgr,
-                estimate_fn=estimate_message_tokens,
+                estimate_fn=lambda m: apply_token_estimation_multiplier(
+                    estimate_message_tokens(m),
+                    context_manager.model,
+                ),
                 config=compact_config,
             )
             context_cybernetics = ContextCyberneticsOrchestrator(
@@ -1254,6 +1278,7 @@ def run_agent_turn(
                 fire_hook_sync(
                     HookEvent.POST_TOOL_USE,
                     tool_name=call["toolName"],
+                    tool_input=call["input"],
                     tool_output=result.output,
                     is_error=not result.ok,
                     step=step,
@@ -1401,7 +1426,8 @@ def run_agent_turn(
             # instead of falling through to the max-step fallback.
             if metrics_collector:
                 total_tokens = sum(
-                    estimate_message_tokens(m) for m in current_messages
+                    apply_token_estimation_multiplier(estimate_message_tokens(m), context_manager.model)
+                    for m in current_messages
                 ) if context_manager else 0
                 metrics_collector.end_turn(total_tokens=total_tokens)
             continue
@@ -1416,7 +1442,8 @@ def run_agent_turn(
 
         if metrics_collector and metrics_collector._current_turn is not None:
             total_tokens = sum(
-                estimate_message_tokens(m) for m in current_messages
+                apply_token_estimation_multiplier(estimate_message_tokens(m), context_manager.model)
+                for m in current_messages
             ) if context_manager else 0
             metrics_collector.end_turn(total_tokens=total_tokens)
 

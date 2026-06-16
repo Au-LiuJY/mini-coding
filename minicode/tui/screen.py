@@ -68,15 +68,18 @@ def _enable_windows_vt_processing() -> None:
                 new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT
                 kernel32.SetConsoleMode(handle, new_mode)
 
-        # Also enable VT input processing so the console sends ANSI
-        # escape sequences for special keys instead of Windows-native
-        # key events (useful for ConPTY / Windows Terminal).
         STD_INPUT_HANDLE = -10
         ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+        ENABLE_MOUSE_INPUT = 0x0010
+        ENABLE_WINDOW_INPUT = 0x0008
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        ENABLE_QUICK_EDIT_MODE = 0x0040
         h_in = kernel32.GetStdHandle(STD_INPUT_HANDLE)
         mode_in = wintypes.DWORD()
         if kernel32.GetConsoleMode(h_in, ctypes.byref(mode_in)):
-            kernel32.SetConsoleMode(h_in, mode_in.value | ENABLE_VIRTUAL_TERMINAL_INPUT)
+            next_mode = mode_in.value | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS
+            next_mode &= ~ENABLE_QUICK_EDIT_MODE
+            kernel32.SetConsoleMode(h_in, next_mode)
 
         _vt_enabled = True
     except Exception:

@@ -455,7 +455,7 @@ def build_provider_config(model: str, runtime: dict | None = None) -> ProviderCo
         deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
         base_url = (
             os.environ.get("CUSTOM_API_BASE_URL", "")
-            or (deepseek_key and "https://api.deepseek.com/v1" or "")
+            or (deepseek_key and "https://api.deepseek.com" or "")
             or runtime.get("customBaseUrl", "")
         ).rstrip("/")
         api_key = (

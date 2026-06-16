@@ -50,6 +50,31 @@ Thumbs.db
 *.tmp
 *.bak
 
-# MiniCode specific
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE / Editor config
+.qwen/
+.claude/
+.trae/
+.workbuddy/
+
+# Debug logs
+.dbg/
+
+# MiniCode runtime data
 .mini-code/
+.mini-code-memory/
+.mini-code-memory-local/
+.mini-code-memory-session/
+.mini-code-tool-results/
 minicode_session/
+
+# Benchmark outputs
+benchmarks/
+
+# Session logs
+session-log.txt
+*.session-log.txt

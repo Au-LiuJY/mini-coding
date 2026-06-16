@@ -49,21 +49,23 @@ def _sanitize_tool_segment(value: str) -> str:
 def _validate_mcp_command(command: str) -> None:
     """验证 MCP 命令的合法性"""
     from pathlib import Path
-    
-    normalized = Path(command).resolve().as_posix()
-    
-    # 不允许路径遍历字符
-    if '..' in normalized or '~' in normalized:
+
+    raw = str(command)
+    path = Path(raw)
+    is_abs = path.is_absolute()
+    normalized = path.resolve().as_posix() if is_abs else raw
+
+    if ".." in normalized or "~" in normalized:
         raise RuntimeError("Invalid MCP command: contains path traversal characters")
-    
-    # 提取命令的基本名称
-    base_command = Path(command).name.lower()
-    # 处理 .exe 后缀
-    if base_command.endswith('.exe'):
-        base_command = base_command[:-4]
+
+    base_command = path.name.lower()
+    for ext in (".exe", ".cmd", ".bat", ".com"):
+        if base_command.endswith(ext):
+            base_command = base_command[: -len(ext)]
+            break
     
     # 如果是绝对路径，需要额外验证
-    if Path(command).is_absolute():
+    if is_abs:
         # 检查是否在常见的系统目录中
         home_posix = str(Path.home().as_posix())
         allowed_system_dirs = [
@@ -88,7 +90,6 @@ def _validate_mcp_command(command: str) -> None:
         
         is_in_allowed_dir = any(normalized.lower().startswith(d.lower()) for d in allowed_system_dirs)
         
-        # 不在允许的系统目录且不在白名单中
         if not is_in_allowed_dir and base_command not in ALLOWED_COMMANDS:
             raise RuntimeError(
                 f"MCP command \"{command}\" is not in the allowed list. "
@@ -249,6 +250,17 @@ class StdioMcpClient:
             self._start_error = None
         
         last_error: Exception | None = None
+        configured_init_timeout = self.config.get("initTimeoutSeconds")
+        try:
+            init_timeout_seconds = float(
+                os.environ.get("MINICODE_MCP_INIT_TIMEOUT", "")
+                or (configured_init_timeout if configured_init_timeout is not None else 0)
+                or 15.0
+            )
+        except (TypeError, ValueError):
+            init_timeout_seconds = 15.0
+        init_timeout_seconds = max(2.0, min(120.0, init_timeout_seconds))
+
         for protocol in self._protocol_candidates():
             try:
                 self._spawn_process()
@@ -260,7 +272,7 @@ class StdioMcpClient:
                         "capabilities": {},
                         "clientInfo": {"name": "mini-code", "version": "0.1.0"},
                     },
-                    timeout_seconds=2.0,
+                    timeout_seconds=init_timeout_seconds,
                 )
                 self.notify("notifications/initialized", {})
                 self._started = True
@@ -289,6 +301,11 @@ class StdioMcpClient:
             raise RuntimeError(f'MCP server "{self.server_name}" has no command configured.')
 
         # 安全验证：检查命令和参数的合法性
+        if os.name == "nt" and not Path(command).is_absolute():
+            import shutil
+            resolved = shutil.which(command)
+            if resolved:
+                command = resolved
         _validate_mcp_command(command)
         _validate_mcp_args(list(self.config.get("args", []) or []))
 

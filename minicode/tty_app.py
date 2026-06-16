@@ -37,7 +37,7 @@ from minicode.tui.event_flow import _handle_event as _handle_tty_event
 from minicode.tui.runtime_control import _ThrottledRenderer, enter_tty_runtime, exit_tty_runtime, install_sigwinch_rerender
 from minicode.tui.session_flow import handle_session_listing, load_or_create_session, build_tty_runtime_state, install_permission_prompt, finalize_tty_session
 from minicode.tui.renderer import _render_screen
-from minicode.tui.input_handler import _RawModeContext, _handle_input, _win_read_one_key
+from minicode.tui.input_handler import _RawModeContext, _handle_input, _win_read_input_chunk
 
 # Terminal size — use unified cache from chrome module
 # ---------------------------------------------------------------------------
@@ -130,20 +130,11 @@ def run_tty_app(
 
                 # Read raw input
                 if sys.platform == "win32":
-                    import msvcrt
-
-                    if not msvcrt.kbhit():
-                        # Flush any deferred renders during idle
+                    chunk = _win_read_input_chunk()
+                    if not chunk:
                         throttled.flush()
-                        time.sleep(0.05)  # 从 0.02 增加到 0.05 降低 CPU 使用率
+                        time.sleep(0.05)
                         continue
-                    # Use _win_read_one_key to translate special keys
-                    chunk = ""
-                    while True:
-                        ch = _win_read_one_key()
-                        if not ch:
-                            break
-                        chunk += ch
                 else:
                     import select
 

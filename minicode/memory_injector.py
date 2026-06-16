@@ -4,6 +4,7 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from minicode.memory import MemoryManager, MemoryScope, MemoryEntry
@@ -424,6 +425,35 @@ class MemoryInjector:
             score += 0.2
         elif entry.category == "convention" and any(kw in task_lower for kw in ["style", "naming", "format"]):
             score += 0.2
+
+        if current_files:
+            current_norm: list[str] = []
+            for p in current_files:
+                try:
+                    current_norm.append(Path(str(p)).as_posix().lstrip("./"))
+                except Exception:
+                    continue
+
+            entry_file_tags: list[str] = []
+            for tag in entry.tags:
+                if isinstance(tag, str) and tag.startswith("file:"):
+                    entry_file_tags.append(tag[len("file:") :].strip().lstrip("./").replace("\\", "/"))
+
+            if entry_file_tags and current_norm:
+                matched = False
+                for et in entry_file_tags:
+                    if not et:
+                        continue
+                    for cf in current_norm:
+                        if not cf:
+                            continue
+                        if cf == et or cf.endswith("/" + et) or et.endswith("/" + cf):
+                            matched = True
+                            break
+                    if matched:
+                        break
+                if matched:
+                    score += 0.35
 
         # Boost if memory mentions current files
         if current_files:

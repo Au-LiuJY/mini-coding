@@ -68,7 +68,7 @@ def _scroll_pending_approval_by(state: ScreenState, delta: int) -> bool:
 
 def _toggle_pending_approval_expand(state: ScreenState) -> bool:
     pending = state.pending_approval
-    if not pending or pending.request.get("kind") != "edit":
+    if not pending:
         return False
     pending.details_expanded = not pending.details_expanded
     pending.details_scroll_offset = 0

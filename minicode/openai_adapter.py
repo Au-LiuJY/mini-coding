@@ -249,10 +249,18 @@ class OpenAIModelAdapter:
                 raise RuntimeError(error_msg)
             
             # Cost tracking
+            usage = data.get("usage", {})
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            if input_tokens > 0:
+                try:
+                    from minicode.context_manager import estimate_messages_tokens, record_token_estimation_sample
+                    estimated_input = estimate_messages_tokens(messages)
+                    record_token_estimation_sample(self.runtime["model"], estimated_input, int(input_tokens))
+                except Exception:
+                    pass
+
             if store:
-                usage = data.get("usage", {})
-                input_tokens = usage.get("prompt_tokens", 0)
-                output_tokens = usage.get("completion_tokens", 0)
                 cost_usd = calculate_cost(
                     model=self.runtime["model"],
                     input_tokens=input_tokens,
@@ -312,6 +320,7 @@ class OpenAIModelAdapter:
         stop_reason = None
         stream_input_tokens = 0
         stream_output_tokens = 0
+        stream_input_from_api = False
         
         for line in response:
             line_str = line.decode("utf-8").strip()
@@ -332,6 +341,8 @@ class OpenAIModelAdapter:
                 if usage:
                     stream_input_tokens = usage.get("prompt_tokens", 0)
                     stream_output_tokens = usage.get("completion_tokens", 0)
+                    if stream_input_tokens:
+                        stream_input_from_api = True
                 continue
             
             delta = choices[0].get("delta", {})
@@ -376,6 +387,14 @@ class OpenAIModelAdapter:
                 "input": parsed_input,
             })
         
+        if stream_input_from_api and stream_input_tokens > 0:
+            try:
+                from minicode.context_manager import estimate_messages_tokens, record_token_estimation_sample
+                estimated_input = estimate_messages_tokens(messages)
+                record_token_estimation_sample(self.runtime["model"], estimated_input, int(stream_input_tokens))
+            except Exception:
+                pass
+
         # Streaming cost tracking
         if store:
             # Estimate if not provided in stream

@@ -1,4 +1,4 @@
-﻿"""Memory system integration tests.
+"""Memory system integration tests.
 
 Verifies integration points between the memory subsystem and other
 MiniCode components: ContextManager, Session, Agent Loop, Permissions,
@@ -36,6 +36,9 @@ from minicode.mock_model import MockModelAdapter
 from minicode.permissions import PermissionManager
 from minicode.tools import create_default_tool_registry
 from minicode.prompt import build_system_prompt
+from minicode.memory_injector import MemoryInjector
+from minicode.hooks import HookEvent, fire_hook_sync
+from minicode.memory_pipeline import register_context_aware_memory_curation
 
 from tests.test_helpers import (
     verify_memory_integrity,
@@ -200,6 +203,33 @@ class TestMemoryContextManagerIntegration:
         tokens_after = ctx2.get_stats().total_tokens
 
         assert tokens_after > tokens_before
+
+    def test_memoryfile_search_reuses_idf_cache(self, tmp_workspace: Path, monkeypatch):
+        import minicode.memory as memory_module
+
+        mf = MemoryFile(scope=MemoryScope.PROJECT)
+        for i in range(200):
+            mf.add_entry(MemoryEntry(
+                id=f"e{i}",
+                scope=MemoryScope.PROJECT,
+                category="testing",
+                content=f"Entry {i}: pytest fixture benchmark",
+                tags=["pytest", "fixture", "benchmark"],
+            ))
+
+        calls = {"idf": 0}
+        original_compute_idf = memory_module._compute_idf
+
+        def wrapped_compute_idf(documents):
+            calls["idf"] += 1
+            return original_compute_idf(documents)
+
+        monkeypatch.setattr(memory_module, "_compute_idf", wrapped_compute_idf)
+
+        mf.search("pytest")
+        mf.search("pytest")
+
+        assert calls["idf"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1180,3 +1210,59 @@ class TestCrossCuttingMemoryIntegration:
             mm.add_entry(MemoryScope.PROJECT, "test", f"Entry {i}")
 
         assert len(mm.memories[MemoryScope.PROJECT].entries) <= max_entries
+
+
+class TestContextAwareMemoryCuration:
+    def test_memory_injector_boosts_file_tag_matches(self, tmp_workspace: Path):
+        mm = MemoryManager(project_root=tmp_workspace)
+        mm.add_entry(
+            MemoryScope.PROJECT,
+            "code-pattern",
+            "Login flow (src/main.py): validate input then call service layer",
+            tags=["file:src/main.py"],
+        )
+        mm.add_entry(
+            MemoryScope.PROJECT,
+            "code-pattern",
+            "Login flow (other.py): validate input then call service layer",
+            tags=["file:other.py"],
+        )
+
+        injector = MemoryInjector(memory_manager=mm)
+        injected = injector.inject_for_task(
+            "Improve login flow validation",
+            current_files=["src/main.py"],
+        )
+        assert injected
+        assert "src/main.py" in injected[0].content
+
+    def test_eventized_write_on_post_tool_use(self, tmp_workspace: Path):
+        mm = MemoryManager(project_root=tmp_workspace)
+        unregister = register_context_aware_memory_curation(mm, str(tmp_workspace))
+        try:
+            fire_hook_sync(
+                HookEvent.POST_TOOL_USE,
+                tool_name="edit_file",
+                tool_input={"path": "src/main.py"},
+                tool_output="@@\n+added\n-removed\n",
+                is_error=False,
+            )
+            entries = mm.memories[MemoryScope.LOCAL].entries
+            assert len(entries) >= 1
+            assert any("file:src/main.py" in e.tags for e in entries)
+
+            before = len(entries)
+            fire_hook_sync(
+                HookEvent.POST_TOOL_USE,
+                tool_name="edit_file",
+                tool_input={"path": "src/main.py"},
+                tool_output="@@\n+added\n-removed\n",
+                is_error=False,
+            )
+            after = len(mm.memories[MemoryScope.LOCAL].entries)
+            assert after == before
+        finally:
+            try:
+                unregister()
+            except Exception:
+                pass

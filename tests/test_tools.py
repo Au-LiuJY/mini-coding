@@ -97,6 +97,26 @@ def test_run_command_tool_supports_echo_on_current_platform(tmp_path: Path) -> N
     assert "hello" in result.output.lower()
 
 
+def test_run_command_tool_does_not_treat_python_c_semicolon_as_shell_snippet_on_windows(tmp_path: Path) -> None:
+    import os
+
+    if os.name != "nt":
+        return
+
+    def fail_if_prompted(_request: dict) -> dict:
+        pytest.fail("permission prompt should not trigger for python -c on Windows when command is not a shell snippet")
+
+    permissions = PermissionManager(str(tmp_path), prompt=fail_if_prompted)
+    result = run_command_tool.run(
+        {"command": "python -c print('ok');print('ok2')"},
+        ToolContext(cwd=str(tmp_path), permissions=permissions),
+    )
+
+    assert result.ok is True
+    out = result.output.lower()
+    assert "ok" in out
+
+
 @pytest.mark.parametrize(
     "command",
     [

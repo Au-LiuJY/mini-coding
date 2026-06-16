@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from typing import Any, Callable
-from minicode.tui.state import ScreenState, TtyAppArgs
+from minicode.tui.state import AggregatedEditProgress, ScreenState, TtyAppArgs
 from minicode.cli_commands import try_handle_local_command, find_matching_slash_commands
 from minicode.agent_loop import run_agent_turn
 from minicode.context_manager import save_context_state
@@ -75,6 +75,189 @@ def _win_read_one_key() -> str:
 
     # Ctrl+C → keep as '\x03' so parse_input_chunk handles it
     return ch
+
+
+def _win_read_input_chunk(max_records: int = 64) -> str:
+    if sys.platform != "win32":
+        return ""
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        STD_INPUT_HANDLE = -10
+        h_in = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class KEY_EVENT_RECORD(ctypes.Structure):
+            class CHAR_UNION(ctypes.Union):
+                _fields_ = [("UnicodeChar", wintypes.WCHAR)]
+
+            _fields_ = [
+                ("bKeyDown", wintypes.BOOL),
+                ("wRepeatCount", wintypes.WORD),
+                ("wVirtualKeyCode", wintypes.WORD),
+                ("wVirtualScanCode", wintypes.WORD),
+                ("uChar", CHAR_UNION),
+                ("dwControlKeyState", wintypes.DWORD),
+            ]
+
+        class MOUSE_EVENT_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("dwMousePosition", COORD),
+                ("dwButtonState", wintypes.DWORD),
+                ("dwControlKeyState", wintypes.DWORD),
+                ("dwEventFlags", wintypes.DWORD),
+            ]
+
+        class EVENT_UNION(ctypes.Union):
+            _fields_ = [("KeyEvent", KEY_EVENT_RECORD), ("MouseEvent", MOUSE_EVENT_RECORD)]
+
+        class INPUT_RECORD(ctypes.Structure):
+            _fields_ = [("EventType", wintypes.WORD), ("Event", EVENT_UNION)]
+
+        KEY_EVENT = 0x0001
+        MOUSE_EVENT = 0x0002
+        MOUSE_WHEELED = 0x0004
+
+        VK_BACK = 0x08
+        VK_TAB = 0x09
+        VK_RETURN = 0x0D
+        VK_ESCAPE = 0x1B
+        VK_PRIOR = 0x21
+        VK_NEXT = 0x22
+        VK_END = 0x23
+        VK_HOME = 0x24
+        VK_LEFT = 0x25
+        VK_UP = 0x26
+        VK_RIGHT = 0x27
+        VK_DOWN = 0x28
+        VK_INSERT = 0x2D
+        VK_DELETE = 0x2E
+
+        LEFT_ALT_PRESSED = 0x0002
+        RIGHT_ALT_PRESSED = 0x0001
+        LEFT_CTRL_PRESSED = 0x0008
+        RIGHT_CTRL_PRESSED = 0x0004
+        SHIFT_PRESSED = 0x0010
+
+        def _mod_code(control_state: int) -> int:
+            shift = bool(control_state & SHIFT_PRESSED)
+            alt = bool(control_state & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED))
+            ctrl = bool(control_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED))
+            return 1 + (1 if shift else 0) + (2 if alt else 0) + (4 if ctrl else 0)
+
+        def _arrow_seq(vk: int, mod: int) -> str:
+            code = {
+                VK_UP: "A",
+                VK_DOWN: "B",
+                VK_RIGHT: "C",
+                VK_LEFT: "D",
+                VK_HOME: "H",
+                VK_END: "F",
+            }.get(vk)
+            if not code:
+                return ""
+            if mod == 1:
+                return f"\x1b[{code}"
+            return f"\x1b[1;{mod}{code}"
+
+        def _tilde_seq(n: int, mod: int) -> str:
+            if mod == 1:
+                return f"\x1b[{n}~"
+            return f"\x1b[{n};{mod}~"
+
+        def _ctrl_char(vk: int) -> str:
+            if 0x41 <= vk <= 0x5A:
+                return chr(vk - 0x40)
+            return ""
+
+        count = wintypes.DWORD()
+        if not kernel32.GetNumberOfConsoleInputEvents(h_in, ctypes.byref(count)):
+            return ""
+        if count.value == 0:
+            return ""
+
+        to_read = min(int(count.value), max_records)
+        records = (INPUT_RECORD * to_read)()
+        read = wintypes.DWORD()
+        if not kernel32.ReadConsoleInputW(h_in, records, to_read, ctypes.byref(read)):
+            return ""
+
+        out: list[str] = []
+        for idx in range(int(read.value)):
+            rec = records[idx]
+            if rec.EventType == KEY_EVENT:
+                kev = rec.Event.KeyEvent
+                if not kev.bKeyDown:
+                    continue
+                vk = int(kev.wVirtualKeyCode)
+                control_state = int(kev.dwControlKeyState)
+                mod = _mod_code(control_state)
+                uni = kev.uChar.UnicodeChar
+
+                if uni:
+                    out.append(uni)
+                    continue
+
+                if vk in (VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_HOME, VK_END):
+                    seq = _arrow_seq(vk, mod)
+                    if seq:
+                        out.append(seq)
+                    continue
+
+                if vk == VK_PRIOR:
+                    out.append(_tilde_seq(5, mod))
+                    continue
+                if vk == VK_NEXT:
+                    out.append(_tilde_seq(6, mod))
+                    continue
+                if vk == VK_DELETE:
+                    out.append(_tilde_seq(3, mod))
+                    continue
+                if vk == VK_INSERT:
+                    out.append(_tilde_seq(2, mod))
+                    continue
+
+                if vk == VK_RETURN:
+                    out.append("\r")
+                    continue
+                if vk == VK_TAB:
+                    out.append("\t" if mod == 1 else "\x1b\t")
+                    continue
+                if vk == VK_BACK:
+                    out.append("\x08")
+                    continue
+                if vk == VK_ESCAPE:
+                    out.append("\x1b")
+                    continue
+
+                if mod & 4:
+                    ctrl_char = _ctrl_char(vk)
+                    if ctrl_char:
+                        out.append(ctrl_char)
+                continue
+
+            if rec.EventType == MOUSE_EVENT:
+                mev = rec.Event.MouseEvent
+                if int(mev.dwEventFlags) != MOUSE_WHEELED:
+                    continue
+                delta = ctypes.c_short(int(mev.dwButtonState) >> 16).value
+                if delta == 0:
+                    continue
+                direction = "up" if delta > 0 else "down"
+                steps = max(1, abs(int(delta)) // 120)
+                x = int(mev.dwMousePosition.X) + 1
+                y = int(mev.dwMousePosition.Y) + 1
+                button = 64 if direction == "up" else 65
+                for _ in range(steps):
+                    out.append(f"\x1b[<{button};{x};{y}M")
+
+        return "".join(out)
+    except Exception:
+        return ""
 
 
 def _read_raw_char() -> str:
@@ -282,7 +465,7 @@ def _handle_input(
     """Returns True if /exit was typed."""
     if state.is_busy:
         # Animated spinner during tool execution
-        import itertools, time
+        import itertools
         spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
         tick = int(time.monotonic() * 8) % len(spinners)
         spin = spinners[tick]
@@ -631,6 +814,12 @@ def _handle_input(
                 agent_result["messages"] = next_messages
         except Exception as e:
             agent_error = e
+            try:
+                on_assistant_message(f"ERROR: Agent crashed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            with agent_thread_lock:
+                agent_result["error"] = f"{type(e).__name__}: {e}"
         finally:
             args.permissions.end_turn()
             with agent_thread_lock:

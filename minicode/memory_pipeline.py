@@ -568,3 +568,94 @@ class MemoryPipeline:
                         continue
 
         return entries + neighbors
+
+
+def register_context_aware_memory_curation(
+    memory_manager: Any,
+    workspace_path: str,
+) -> Any:
+    from pathlib import Path
+
+    from minicode.hooks import HookEvent, register_hook
+    from minicode.memory import MemoryScope
+
+    file_tools = {"edit_file", "patch_file", "modify_file", "write_file"}
+    workspace_root = Path(workspace_path)
+    recent_by_file: dict[str, float] = {}
+    recent_contents: set[str] = set()
+
+    def _normalize_file(path_str: str) -> str:
+        p = Path(str(path_str))
+        try:
+            if p.is_absolute():
+                return p.resolve().relative_to(workspace_root.resolve()).as_posix()
+        except Exception:
+            pass
+        return p.as_posix().lstrip("./")
+
+    def _summarize_output(output: str) -> str:
+        out = (output or "").strip()
+        if not out:
+            return ""
+        if out.startswith("@@") or "\n@@" in out[:300] or out.startswith("diff "):
+            additions = out.count("\n+") - out.count("\n+++")
+            deletions = out.count("\n-") - out.count("\n---")
+            if additions > 0 or deletions > 0:
+                return f"+{additions} -{deletions}"
+        first = next((l.strip() for l in out.splitlines() if l.strip()), "")
+        if len(first) > 120:
+            return first[:120] + "..."
+        return first
+
+    def _handler(ctx) -> None:
+        tool_name = ctx.tool_name
+        if tool_name not in file_tools:
+            return
+        if ctx.is_error:
+            return
+        tool_input = ctx.tool_input
+        if not isinstance(tool_input, dict):
+            return
+        raw_path = tool_input.get("path") or tool_input.get("filePath")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return
+        rel_path = _normalize_file(raw_path.strip())
+        now = time.time()
+        last = recent_by_file.get(rel_path, 0.0)
+        if now - last < 30.0:
+            return
+        summary = _summarize_output(ctx.tool_output or "")
+        if not summary:
+            return
+
+        content = f"{tool_name} {rel_path}: {summary}"
+        if content in recent_contents:
+            return
+
+        tags = [f"file:{rel_path}", f"tool:{tool_name}", "event:file"]
+        entry = memory_manager.add_entry(
+            scope=MemoryScope.LOCAL,
+            category="event",
+            content=content,
+            tags=tags,
+        )
+        try:
+            from minicode.domain_classifier import get_active_domain_values
+
+            entry.domains = get_active_domain_values(
+                current_files=[rel_path],
+                intent_text=content,
+            )
+        except Exception:
+            pass
+
+        recent_by_file[rel_path] = now
+        recent_contents.add(content)
+        if len(recent_contents) > 200:
+            recent_contents.clear()
+
+    return register_hook(
+        HookEvent.POST_TOOL_USE,
+        _handler,
+        description="Context-aware memory curation: file-bound, eventized writes for file tools",
+    )

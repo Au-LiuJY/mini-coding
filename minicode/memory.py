@@ -716,6 +716,10 @@ class MemoryFile:
     _avgdl_cache: float | None = field(default=None, repr=False)
     _cache_dirty: bool = field(default=True, repr=False)
 
+    def _invalidate_corpus_stats(self) -> None:
+        self._idf_cache = None
+        self._avgdl_cache = None
+
     def _rebuild_indices(self) -> None:
         self._id_index.clear()
         self._tag_index.clear()
@@ -745,13 +749,37 @@ class MemoryFile:
 
     def _invalidate_cache(self) -> None:
         self._cache_dirty = True
-        self._idf_cache = None
-        self._avgdl_cache = None
+        self._invalidate_corpus_stats()
 
     @property
     def size_bytes(self) -> int:
         """Estimate size in bytes."""
         return sum(len(e.content) for e in self.entries)
+
+    def _drop_entry_from_indices(self, entry: MemoryEntry) -> None:
+        self._id_index.pop(entry.id, None)
+        for tag in entry.tags:
+            s = self._tag_index.get(tag)
+            if s is not None:
+                s.discard(entry)
+                if not s:
+                    self._tag_index.pop(tag, None)
+        cat_list = self._category_index.get(entry.category)
+        if cat_list is not None:
+            try:
+                cat_list.remove(entry)
+            except ValueError:
+                pass
+            if not cat_list:
+                self._category_index.pop(entry.category, None)
+        self._tokens_cache.pop(entry.id, None)
+
+    def _pop_oldest_entry(self) -> MemoryEntry | None:
+        if not self.entries:
+            return None
+        entry = self.entries.pop(0)
+        self._drop_entry_from_indices(entry)
+        return entry
     
     def add_entry(self, entry: MemoryEntry) -> None:
         """Add entry, respecting limits. Maintains indices incrementally."""
@@ -767,6 +795,7 @@ class MemoryFile:
             self._category_index[cat] = []
         self._category_index[cat].append(entry)
         self._tokens_cache[entry.id] = entry.get_tokens()
+        self._invalidate_corpus_stats()
         self._enforce_limits()
     
     def update_entry(self, entry_id: str, content: str) -> bool:
@@ -779,6 +808,7 @@ class MemoryFile:
         entry.updated_at = time.time()
         entry.invalidate_tokens()
         self._tokens_cache[entry.id] = entry.get_tokens()
+        self._invalidate_corpus_stats()
         return True
     
     def delete_entry(self, entry_id: str) -> bool:
@@ -787,15 +817,12 @@ class MemoryFile:
         entry = self._id_index.get(entry_id)
         if entry is None:
             return False
-        self.entries.remove(entry)
-        del self._id_index[entry_id]
-        for tag in entry.tags:
-            if tag in self._tag_index:
-                self._tag_index[tag].discard(entry)
-        cat = entry.category
-        if cat in self._category_index and entry in self._category_index[cat]:
-            self._category_index[cat].remove(entry)
-        self._tokens_cache.pop(entry_id, None)
+        try:
+            self.entries.remove(entry)
+        except ValueError:
+            pass
+        self._drop_entry_from_indices(entry)
+        self._invalidate_corpus_stats()
         return True
     
     def get_entries_by_category(self, category: str) -> list[MemoryEntry]:
@@ -803,35 +830,52 @@ class MemoryFile:
         self._ensure_cache_valid()
         return list(self._category_index.get(category, []))
     
-    def search(self, query: str, active_domains: list[str] | None = None) -> list[MemoryEntry]:
-        """Search entries by keyword with BM25 + domain relevance scoring.
-
-        Combines BM25 semantic relevance with usage frequency and optional
-        domain-based boosting (soft blend, not hard filtering).
-        Domain score uses Jaccard similarity between entry domains and active domains.
-        """
+    def search_scored(
+        self,
+        query: str,
+        *,
+        active_domains: list[str] | None = None,
+    ) -> list[tuple[float, MemoryEntry]]:
         if not self.entries:
             return []
+
+        self._ensure_cache_valid()
 
         query_tokens = _tokenize(query)
         query_tokens = _expand_query_terms(query_tokens, active_domains=active_domains)
         if not query_tokens:
             return []
 
+        if self._idf_cache is None or self._avgdl_cache is None:
+            if self._tokens_cache:
+                all_tokens = list(self._tokens_cache.values())
+                self._idf_cache = _compute_idf(all_tokens)
+                self._avgdl_cache = _compute_avgdl(all_tokens)
+            else:
+                self._idf_cache = {}
+                self._avgdl_cache = 0.0
+
+        idf = self._idf_cache
+        avgdl = self._avgdl_cache or 0.0
+
         query_lower = query.lower()
         query_terms = query_lower.split()
 
-        entry_tokens = []
-        for entry in self.entries:
-            text = f"{entry.content} {entry.category} {' '.join(entry.tags)}"
-            entry_tokens.append(_tokenize(text))
-
-        idf = _compute_idf(entry_tokens)
-        avgdl = _compute_avgdl(entry_tokens)
-
         scored: list[tuple[float, MemoryEntry]] = []
-        for i, entry in enumerate(self.entries):
-            bm25 = _bm25_score(query_tokens, entry_tokens[i], idf, avgdl)
+        for entry in self.entries:
+            doc_tokens = self._tokens_cache.get(entry.id)
+            if doc_tokens is None:
+                doc_tokens = entry.get_tokens()
+                self._tokens_cache[entry.id] = doc_tokens
+                self._invalidate_corpus_stats()
+                if self._idf_cache is None or self._avgdl_cache is None:
+                    all_tokens = list(self._tokens_cache.values())
+                    self._idf_cache = _compute_idf(all_tokens)
+                    self._avgdl_cache = _compute_avgdl(all_tokens)
+                    idf = self._idf_cache
+                    avgdl = self._avgdl_cache or 0.0
+
+            bm25 = _bm25_score(query_tokens, doc_tokens, idf or {}, avgdl)
 
             substring_score = 0.0
             content_lower = entry.content.lower()
@@ -841,12 +885,8 @@ class MemoryFile:
                 substring_score = 1.0
 
             tag_score = 0.0
-            exact_tag_match = any(
-                tag.lower() == query_lower for tag in entry.tags
-            )
-            partial_tag_match = any(
-                query_lower in tag.lower() for tag in entry.tags
-            )
+            exact_tag_match = any(tag.lower() == query_lower for tag in entry.tags)
+            partial_tag_match = any(query_lower in tag.lower() for tag in entry.tags)
             if exact_tag_match:
                 tag_score = 5.0
             elif partial_tag_match:
@@ -858,7 +898,6 @@ class MemoryFile:
             if match_score <= 0:
                 continue
 
-            # Domain score: Jaccard similarity between entry.domains and active_domains
             domain_score = 0.0
             if active_domains and entry.domains:
                 entry_set = set(entry.domains)
@@ -867,7 +906,6 @@ class MemoryFile:
                 union = entry_set | active_set
                 domain_score = len(intersection) / len(union) if union else 0.0
 
-            # Soft blend: BM25 dominates, domain provides light steering
             final_relevance = match_score * 0.7 + domain_score * 0.3
 
             usage_bonus = math.log1p(entry.usage_count) * 0.3
@@ -878,20 +916,37 @@ class MemoryFile:
             scored.append((total_score, entry))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        # Increment usage_count for top results to feed back into future scoring
         for _, entry in scored[:10]:
             entry.usage_count += 1
-        return [entry for _, entry in scored]
+        return scored
+
+    def search(self, query: str, active_domains: list[str] | None = None) -> list[MemoryEntry]:
+        """Search entries by keyword with BM25 + domain relevance scoring.
+
+        Combines BM25 semantic relevance with usage frequency and optional
+        domain-based boosting (soft blend, not hard filtering).
+        Domain score uses Jaccard similarity between entry domains and active domains.
+        """
+        return [entry for _, entry in self.search_scored(query, active_domains=active_domains)]
     
     def _enforce_limits(self) -> None:
         """Remove oldest entries if exceeding limits."""
+        removed_any = False
         # Check entry count
         while len(self.entries) > self.max_entries:
-            self.entries.pop(0)  # Remove oldest
+            popped = self._pop_oldest_entry()
+            if popped is None:
+                break
+            removed_any = True
         
         # Check size
         while self.size_bytes > self.max_size_bytes and self.entries:
-            self.entries.pop(0)
+            popped = self._pop_oldest_entry()
+            if popped is None:
+                break
+            removed_any = True
+        if removed_any:
+            self._invalidate_corpus_stats()
     
     def format_as_markdown(self, include_header: bool = True) -> str:
         """Format as MEMORY.md content."""
@@ -1280,36 +1335,34 @@ class MemoryManager:
         Returns:
             Entries ranked by relevance (TF-IDF + domain + usage + recency)
         """
-        results = []
+        scored: list[tuple[float, MemoryEntry]] = []
 
         scopes_to_search = [scope] if scope else list(MemoryScope)
-
         for s in scopes_to_search:
-            results.extend(self.memories[s].search(query, active_domains=active_domains))
+            scored.extend(self.memories[s].search_scored(query, active_domains=active_domains))
 
-        # Apply minimum relevance threshold
-        # (entries are already scored by MemoryFile.search)
-        if min_relevance > 0:
-            # Normalize scores to 0-1 range for threshold comparison
-            if results:
-                max_score = max(
-                    self._score_entry(e, _tokenize(query)) for e in results
-                )
-                if max_score > 0:
-                    results = [
-                        e for e in results
-                        if self._score_entry(e, _tokenize(query)) / max_score >= min_relevance
-                    ]
+        if not scored:
+            return []
 
-        # Results are already ranked by MemoryFile.search()
-        # Deduplicate by content (keep highest-scored)
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        if min_relevance > 0.0:
+            max_score = scored[0][0]
+            if max_score > 0.0:
+                scored = [
+                    (score, entry)
+                    for score, entry in scored
+                    if (score / max_score) >= min_relevance
+                ]
+
         seen_content: set[str] = set()
-        deduped = []
-        for entry in results:
+        deduped: list[MemoryEntry] = []
+        for _, entry in scored:
             content_key = entry.content[:100].strip().lower()
-            if content_key not in seen_content:
-                seen_content.add(content_key)
-                deduped.append(entry)
+            if content_key in seen_content:
+                continue
+            seen_content.add(content_key)
+            deduped.append(entry)
 
         return deduped[:limit]
 

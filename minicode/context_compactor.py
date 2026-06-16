@@ -172,6 +172,12 @@ class ToolResultBudgetManager:
         self._persist_threshold = persist_threshold
         self._results_dir = self._workspace / ".mini-code-tool-results"
         self._persisted: dict[str, ToolResultPersisted] = {}
+        self._metrics_path = self._results_dir / "tool_budget_metrics.jsonl"
+        self._token_before: list[int] = []
+        self._token_after: list[int] = []
+        self._tool_results_seen = 0
+        self._tool_results_persisted = 0
+        self._metrics_run_started = False
 
     def check_and_replace(
         self,
@@ -187,6 +193,7 @@ class ToolResultBudgetManager:
 
         modified = list(messages)
         bytes_saved = 0
+        recorded = 0
 
         for i, msg in enumerate(modified):
             if msg.get("role") != "tool_result":
@@ -195,18 +202,111 @@ class ToolResultBudgetManager:
             content = msg.get("content", "")
             content_size = len(content)
 
+            if msg.get("_tool_budget_seen") is True:
+                continue
+
+            self._tool_results_seen += 1
+
             if content_size <= self._persist_threshold:
+                try:
+                    from minicode.context_manager import estimate_message_tokens
+                    tokens = int(estimate_message_tokens(msg))
+                except Exception:
+                    tokens = int(len(content) // 4)
+                self._token_before.append(tokens)
+                self._token_after.append(tokens)
+                msg["_tool_budget_seen"] = True
+                recorded += 1
                 continue
 
             tool_name = msg.get("toolName", "unknown")
             persisted = self._persist_content(content, tool_name, i)
 
             preview = self._generate_preview(content, tool_name, persisted.persisted_path)
-            modified[i] = {**msg, "content": preview, "_persisted_path": str(persisted.persisted_path)}
+            new_msg = {**msg, "content": preview, "_persisted_path": str(persisted.persisted_path)}
+            try:
+                from minicode.context_manager import estimate_message_tokens
+                before_tokens = int(estimate_message_tokens(msg))
+                after_tokens = int(estimate_message_tokens(new_msg))
+            except Exception:
+                before_tokens = int(len(content) // 4)
+                after_tokens = int(len(preview) // 4)
+            self._token_before.append(before_tokens)
+            self._token_after.append(after_tokens)
+            self._tool_results_persisted += 1
+            new_msg["_tool_budget_seen"] = True
+            modified[i] = new_msg
             self._persisted[f"{i}-{tool_name}"] = persisted
             bytes_saved += content_size - len(preview)
+            recorded += 1
+            self._append_metric(
+                {
+                    "ts": time.time(),
+                    "index": i,
+                    "tool": str(tool_name),
+                    "threshold_chars": int(self._persist_threshold),
+                    "persisted": True,
+                    "before_chars": int(content_size),
+                    "after_chars": int(len(preview)),
+                    "before_tokens": int(before_tokens),
+                    "after_tokens": int(after_tokens),
+                    "persisted_path": str(persisted.persisted_path),
+                }
+            )
+
+        if recorded:
+            self._trim_samples()
 
         return modified, bytes_saved
+
+    def _append_metric(self, payload: dict[str, Any]) -> None:
+        try:
+            if not self._results_dir.exists():
+                self._results_dir.mkdir(parents=True, exist_ok=True)
+            if not self._metrics_run_started:
+                self._metrics_run_started = True
+                run_header = {"ts": time.time(), "event": "run_start", "threshold_chars": int(self._persist_threshold)}
+                with open(self._metrics_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(run_header, ensure_ascii=False) + "\n")
+            with open(self._metrics_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _trim_samples(self) -> None:
+        cap = 2000
+        if len(self._token_before) > cap:
+            self._token_before = self._token_before[-cap:]
+        if len(self._token_after) > cap:
+            self._token_after = self._token_after[-cap:]
+
+    def get_token_stats(self) -> dict[str, Any]:
+        def _pct(vals: list[int], p: float) -> int:
+            if not vals:
+                return 0
+            s = sorted(vals)
+            k = (len(s) - 1) * p
+            f = int(k)
+            c = min(f + 1, len(s) - 1)
+            if c == f:
+                return int(s[f])
+            return int(s[f] + (s[c] - s[f]) * (k - f))
+
+        total = int(self._tool_results_seen)
+        persisted = int(self._tool_results_persisted)
+        rate = (persisted / max(1, total)) if total else 0.0
+        return {
+            "threshold_chars": int(self._persist_threshold),
+            "tool_results_seen": total,
+            "tool_results_persisted": persisted,
+            "persist_rate": rate,
+            "before_p50": _pct(self._token_before, 0.50),
+            "before_p95": _pct(self._token_before, 0.95),
+            "after_p50": _pct(self._token_after, 0.50),
+            "after_p95": _pct(self._token_after, 0.95),
+            "samples": int(min(len(self._token_before), len(self._token_after))),
+            "metrics_path": str(self._metrics_path),
+        }
 
     def _persist_content(
         self, content: str, tool_name: str, index: int
@@ -250,9 +350,22 @@ class ToolResultBudgetManager:
         self, content: str, tool_name: str, path: Path
     ) -> str:
         """Generate preview text for persisted content."""
+        json_summary = self._try_json_summary(content)
+        if json_summary:
+            parts = [
+                f"[Tool result persisted to disk — {len(content)} chars]",
+                f"Tool: {tool_name}",
+                f"Path: {path.name}",
+                "",
+                "--- Summary ---",
+                json_summary,
+            ]
+            preview = "\n".join(parts)
+            return preview[: self.PREVIEW_MAX_CHARS]
+
         lines = content.splitlines()
-        head_lines = lines[:8]
-        tail_lines = lines[-3:] if len(lines) > 12 else []
+        head_lines = lines[:6]
+        tail_lines = lines[-2:] if len(lines) > 10 else []
 
         parts = [
             f"[Tool result persisted to disk — {len(content)} chars]",
@@ -263,17 +376,79 @@ class ToolResultBudgetManager:
         ]
         parts.extend(head_lines)
         if tail_lines:
-            parts.append(f"... ({len(lines) - len(head_lines) - len(tail_lines)} lines omitted) ...")
+            parts.append(
+                f"... ({len(lines) - len(head_lines) - len(tail_lines)} lines omitted) ..."
+            )
             parts.extend(tail_lines)
 
         preview = "\n".join(parts)
-        return preview[:self.PREVIEW_MAX_CHARS]
+        return preview[: self.PREVIEW_MAX_CHARS]
+
+    def _try_json_summary(self, content: str) -> str:
+        stripped = content.lstrip()
+        if not stripped:
+            return ""
+        if stripped[0] not in ("{", "["):
+            return ""
+        if len(stripped) < 2:
+            return ""
+        try:
+            obj = json.loads(stripped)
+        except Exception:
+            return ""
+
+        if isinstance(obj, dict):
+            keys = list(obj.keys())
+            shown = keys[:20]
+            types = {k: type(obj.get(k)).__name__ for k in shown}
+            parts = [
+                f"JSON object: {len(keys)} keys",
+                "Keys: " + ", ".join(str(k) for k in shown),
+                "Types: " + ", ".join(f"{k}={t}" for k, t in types.items()),
+            ]
+            if len(keys) > len(shown):
+                parts.append(f"... (+{len(keys) - len(shown)} more keys)")
+            return "\n".join(parts)
+
+        if isinstance(obj, list):
+            n = len(obj)
+            type_counts: dict[str, int] = {}
+            sample_keys: list[str] = []
+            for item in obj[: min(50, n)]:
+                t = type(item).__name__
+                type_counts[t] = type_counts.get(t, 0) + 1
+                if isinstance(item, dict) and not sample_keys:
+                    sample_keys = list(item.keys())[:20]
+
+            types = ", ".join(f"{k}={v}" for k, v in sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0])))
+            parts = [f"JSON array: {n} items", f"Item types (sample): {types}"]
+            if sample_keys:
+                parts.append("Example keys: " + ", ".join(str(k) for k in sample_keys))
+            return "\n".join(parts)
+
+        return f"JSON value: {type(obj).__name__}"
 
     def get_persisted_count(self) -> int:
         return len(self._persisted)
 
     def get_total_saved_bytes(self) -> int:
         return sum(r.original_size for r in self._persisted.values())
+
+    @property
+    def budget_per_message(self) -> int:
+        return int(self._budget)
+
+    @budget_per_message.setter
+    def budget_per_message(self, value: int) -> None:
+        self._budget = max(0, int(value))
+
+    @property
+    def persist_threshold(self) -> int:
+        return int(self._persist_threshold)
+
+    @persist_threshold.setter
+    def persist_threshold(self, value: int) -> None:
+        self._persist_threshold = max(0, int(value))
 
 
 # ---------------------------------------------------------------------------
@@ -1080,10 +1255,16 @@ class ContextCompactor:
         return self._last_compact_result
 
     def get_stats(self) -> dict[str, Any]:
+        token_stats = {}
+        try:
+            token_stats = self._tool_budget.get_token_stats()
+        except Exception:
+            token_stats = {}
         return {
             "total_passes": self._total_optimization_passes,
             "tool_results_persisted": self._tool_budget.get_persisted_count(),
             "tool_bytes_saved": self._tool_budget.get_total_saved_bytes(),
+            "tool_token_stats": token_stats,
             "read_dedup_entries": len(self._read_dedup._entries),
             "microcompact_tokens_cleared": self._microcompact._state.total_tokens_cleared,
             "auto_compact_boundaries": len(self._auto_compact.get_history()),

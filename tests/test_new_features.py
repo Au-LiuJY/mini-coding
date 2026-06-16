@@ -22,6 +22,11 @@ from minicode.context_manager import (
     estimate_message_tokens,
     estimate_messages_tokens,
     estimate_tokens,
+    apply_token_estimation_multiplier,
+    get_token_estimation_multiplier,
+    get_token_estimation_multiplier_for_estimate,
+    record_token_estimation_sample,
+    reset_token_estimation_calibration,
     load_context_state,
     save_context_state,
 )
@@ -145,6 +150,93 @@ def test_context_manager_persistence(tmp_path):
         assert loaded is not None
         assert loaded.model == "claude-sonnet-4-20250514"
         assert len(loaded.messages) == 1
+
+
+def test_token_estimation_calibration_updates_multiplier(tmp_path, monkeypatch):
+    import minicode.context_manager as cm
+    monkeypatch.setattr(cm, "MINI_CODE_DIR", tmp_path)
+    reset_token_estimation_calibration()
+    model = "gpt-4o"
+    assert get_token_estimation_multiplier(model) == 1.0
+
+    record_token_estimation_sample(model, estimated_input_tokens=1000, actual_input_tokens=2000)
+    m1 = get_token_estimation_multiplier(model)
+    assert 1.0 < m1 < 2.0
+
+    record_token_estimation_sample(model, estimated_input_tokens=1000, actual_input_tokens=2000)
+    m2 = get_token_estimation_multiplier(model)
+    assert m2 > m1
+
+    bucket_m = get_token_estimation_multiplier_for_estimate(model, 800)
+    assert bucket_m >= 1.0
+
+
+def test_context_manager_stats_apply_calibration_multiplier(tmp_path, monkeypatch):
+    import minicode.context_manager as cm
+    monkeypatch.setattr(cm, "MINI_CODE_DIR", tmp_path)
+    reset_token_estimation_calibration()
+    manager = ContextManager(model="gpt-4o", context_window=100000)
+    manager.add_message({"role": "user", "content": "x" * 1000})
+    baseline = manager.get_stats().total_tokens
+    assert baseline > 0
+
+    record_token_estimation_sample("gpt-4o", estimated_input_tokens=baseline, actual_input_tokens=baseline * 2)
+    calibrated = manager.get_stats().total_tokens
+    assert calibrated > baseline
+
+    applied = apply_token_estimation_multiplier(baseline, "gpt-4o")
+    assert applied == calibrated or applied > baseline
+
+
+def test_token_estimation_calibration_ignores_tiny_estimates(tmp_path, monkeypatch):
+    import minicode.context_manager as cm
+    monkeypatch.setattr(cm, "MINI_CODE_DIR", tmp_path)
+    reset_token_estimation_calibration()
+    model = "deepseek-v4-flash"
+    record_token_estimation_sample(model, estimated_input_tokens=10, actual_input_tokens=200)
+    assert cm.get_token_estimation_calibration_stats() == {}
+
+
+def test_token_estimation_error_stats_baseline_vs_calibrated(tmp_path, monkeypatch):
+    import minicode.context_manager as cm
+    monkeypatch.setattr(cm, "MINI_CODE_DIR", tmp_path)
+    reset_token_estimation_calibration()
+    model = "deepseek-v4-flash"
+    record_token_estimation_sample(model, estimated_input_tokens=1000, actual_input_tokens=2000)
+    stats = cm.get_token_estimation_error_stats()[model]
+    assert 0.0 < float(stats["baseline_error_p50"]) <= 1.0
+    assert 0.0 < float(stats["calibrated_error_p50"]) <= 1.0
+    assert float(stats["calibrated_error_p50"]) < float(stats["baseline_error_p50"])
+
+
+def test_token_estimation_bucket_stats_separate_buckets(tmp_path, monkeypatch):
+    import minicode.context_manager as cm
+    monkeypatch.setattr(cm, "MINI_CODE_DIR", tmp_path)
+    reset_token_estimation_calibration()
+    model = "deepseek-v4-flash"
+    record_token_estimation_sample(model, estimated_input_tokens=200, actual_input_tokens=400)
+    record_token_estimation_sample(model, estimated_input_tokens=2000, actual_input_tokens=4000)
+    b = cm.get_token_estimation_bucket_stats()[model]
+    assert "lt1024" in b
+    assert "lt4096" in b
+    assert int(b["lt1024"]["samples"]) >= 1
+    assert int(b["lt4096"]["samples"]) >= 1
+
+
+def test_token_estimation_calibrator_loads_legacy_state(tmp_path, monkeypatch):
+    import minicode.context_manager as cm
+    monkeypatch.setattr(cm, "MINI_CODE_DIR", tmp_path)
+    legacy = {
+        "updated_at": 0,
+        "models": {
+            "deepseek-v4-flash": {"multiplier": 2.5, "samples": 7, "last_ratio": 3.0, "errors": [0.1, 0.2]},
+        },
+    }
+    (tmp_path / "token_estimation_calibration.json").write_text(json.dumps(legacy), encoding="utf-8")
+    inst = cm.TokenEstimationCalibrator()
+    s = inst.get_stats()["deepseek-v4-flash"]
+    assert float(s["multiplier"]) == pytest.approx(2.5)
+    assert int(s["samples"]) == 7
 
 
 # ---------------------------------------------------------------------------

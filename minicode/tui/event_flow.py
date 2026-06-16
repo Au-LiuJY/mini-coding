@@ -71,6 +71,10 @@ def _handle_pending_approval_key(
 ) -> bool:
     pending = state.pending_approval
 
+    if event.ctrl and event.name == "o" and _toggle_pending_approval_expand(state):
+        rerender()
+        return True
+
     if event.name == "escape":
         approval_result.clear()
         approval_result["decision"] = "deny_once"
@@ -117,6 +121,10 @@ def _handle_pending_approval_text(
     pending = state.pending_approval
 
     if event.text == "v" and _toggle_pending_approval_expand(state):
+        rerender()
+        return True
+
+    if event.ctrl and event.text == "o" and _toggle_pending_approval_expand(state):
         rerender()
         return True
 

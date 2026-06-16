@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -70,11 +72,465 @@ _CJK_PATTERN = re.compile(r'[\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7A
 
 # LRU 缓存：token 估算被频繁调用（每条消息、每次上下文检查），
 # 相同文本的 token 数是确定性的，缓存可避免重复计算。
-_token_cache: dict[str, int] = {}
 _TOKEN_CACHE_MAX = 1024
 
 
+_token_cache: OrderedDict[str, int] = OrderedDict()
+_token_cache_lock = threading.Lock()
+_token_cache_hits = 0
+_token_cache_misses = 0
+_token_cache_sets = 0
+_token_cache_evictions = 0
+
+
+def _make_token_cache_key(text: str) -> str:
+    if len(text) < 256:
+        return f"t:{text}"
+    return f"h:{len(text)}:{hash(text)}"
+
+
+def reset_token_cache_stats() -> None:
+    global _token_cache_hits, _token_cache_misses, _token_cache_sets, _token_cache_evictions
+    with _token_cache_lock:
+        _token_cache_hits = 0
+        _token_cache_misses = 0
+        _token_cache_sets = 0
+        _token_cache_evictions = 0
+
+
+def get_token_cache_stats() -> dict[str, int]:
+    with _token_cache_lock:
+        return {
+            "hits": _token_cache_hits,
+            "misses": _token_cache_misses,
+            "sets": _token_cache_sets,
+            "evictions": _token_cache_evictions,
+            "size": len(_token_cache),
+            "max_size": _TOKEN_CACHE_MAX,
+        }
+
+
+class TokenEstimationCalibrator:
+    def __init__(
+        self,
+        *,
+        alpha: float = 0.15,
+        ratio_min: float = 0.50,
+        ratio_max: float = 8.00,
+        min_estimated_input_tokens: int = 50,
+        max_error_samples: int = 200,
+        bucket_edges: tuple[int, int] = (1024, 4096),
+    ) -> None:
+        self._alpha = float(alpha)
+        self._ratio_min = float(ratio_min)
+        self._ratio_max = float(ratio_max)
+        self._min_estimated_input_tokens = int(min_estimated_input_tokens)
+        self._max_error_samples = int(max_error_samples)
+        self._bucket_edges = tuple(int(x) for x in bucket_edges)
+        self._lock = threading.Lock()
+        self._by_model: dict[str, dict[str, Any]] = {}
+        self._last_persist_time: float = 0.0
+        self._persist_interval_s: float = 2.0
+        self._load_from_disk()
+
+    def _state_path(self):
+        return MINI_CODE_DIR / "token_estimation_calibration.json"
+
+    def _load_from_disk(self) -> None:
+        path = self._state_path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        models = data.get("models")
+        if not isinstance(models, dict):
+            return
+        cleaned: dict[str, dict[str, Any]] = {}
+        for model, mdata in models.items():
+            if not isinstance(model, str) or not isinstance(mdata, dict):
+                continue
+            if "overall" in mdata and isinstance(mdata.get("overall"), dict):
+                overall = mdata.get("overall", {})
+                buckets = mdata.get("buckets", {})
+                cleaned[model] = {
+                    "overall": self._clean_entry(overall),
+                    "buckets": self._clean_buckets(buckets),
+                }
+                continue
+
+            multiplier = mdata.get("multiplier", 1.0)
+            samples = mdata.get("samples", 0)
+            last_ratio = mdata.get("last_ratio", 1.0)
+            errors = mdata.get("errors", [])
+            if not isinstance(multiplier, (int, float)) or not isinstance(samples, int) or not isinstance(last_ratio, (int, float)):
+                continue
+            cleaned[model] = {
+                "overall": {
+                    "multiplier": float(multiplier),
+                    "samples": int(samples),
+                    "last_ratio": float(last_ratio),
+                    "baseline_errors": [],
+                    "calibrated_errors": self._clean_float_list(errors),
+                },
+                "buckets": {},
+            }
+        with self._lock:
+            self._by_model = cleaned
+
+    def _clean_float_list(self, values: Any) -> list[float]:
+        out: list[float] = []
+        if isinstance(values, list):
+            for v in values[-self._max_error_samples:]:
+                if isinstance(v, (int, float)):
+                    out.append(float(v))
+        return out
+
+    def _clean_entry(self, entry: Any) -> dict[str, Any]:
+        if not isinstance(entry, dict):
+            return {
+                "multiplier": 1.0,
+                "samples": 0,
+                "last_ratio": 1.0,
+                "baseline_errors": [],
+                "calibrated_errors": [],
+            }
+        multiplier = entry.get("multiplier", 1.0)
+        samples = entry.get("samples", 0)
+        last_ratio = entry.get("last_ratio", 1.0)
+        baseline_errors = entry.get("baseline_errors", entry.get("baseline", []))
+        calibrated_errors = entry.get("calibrated_errors", entry.get("errors", []))
+        if not isinstance(multiplier, (int, float)):
+            multiplier = 1.0
+        if not isinstance(samples, int):
+            samples = 0
+        if not isinstance(last_ratio, (int, float)):
+            last_ratio = 1.0
+        return {
+            "multiplier": float(multiplier),
+            "samples": int(samples),
+            "last_ratio": float(last_ratio),
+            "baseline_errors": self._clean_float_list(baseline_errors),
+            "calibrated_errors": self._clean_float_list(calibrated_errors),
+        }
+
+    def _clean_buckets(self, buckets: Any) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        if not isinstance(buckets, dict):
+            return out
+        for k, v in buckets.items():
+            if not isinstance(k, str):
+                continue
+            out[k] = self._clean_entry(v)
+        return out
+
+    def _persist_to_disk_if_needed(self) -> None:
+        now = time.time()
+        if now - self._last_persist_time < self._persist_interval_s:
+            return
+        self._last_persist_time = now
+        path = self._state_path()
+        try:
+            MINI_CODE_DIR.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                models: dict[str, Any] = {}
+                for model, data in self._by_model.items():
+                    overall = self._clean_entry(data.get("overall"))
+                    buckets = self._clean_buckets(data.get("buckets", {}))
+                    models[model] = {"overall": overall, "buckets": buckets}
+            payload = {"schema_version": 2, "updated_at": now, "models": models}
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def reset(self) -> None:
+        with self._lock:
+            self._by_model.clear()
+        path = self._state_path()
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+    def _bucket_key(self, estimated_input_tokens: int) -> str:
+        if estimated_input_tokens < self._bucket_edges[0]:
+            return f"lt{self._bucket_edges[0]}"
+        if estimated_input_tokens < self._bucket_edges[1]:
+            return f"lt{self._bucket_edges[1]}"
+        return f"ge{self._bucket_edges[1]}"
+
+    def _ensure_model(self, model: str) -> dict[str, Any]:
+        key = model or "unknown"
+        data = self._by_model.get(key)
+        if isinstance(data, dict) and "overall" in data and "buckets" in data:
+            return data
+        data = {
+            "overall": {
+                "multiplier": 1.0,
+                "samples": 0,
+                "last_ratio": 1.0,
+                "baseline_errors": [],
+                "calibrated_errors": [],
+            },
+            "buckets": {},
+        }
+        self._by_model[key] = data
+        return data
+
+    def _update_entry(self, entry: dict[str, Any], ratio: float, estimated: int, actual: int) -> None:
+        prev = float(entry.get("multiplier", 1.0))
+        updated = prev * (1.0 - self._alpha) + ratio * self._alpha
+        entry["multiplier"] = updated
+        entry["samples"] = int(entry.get("samples", 0)) + 1
+        entry["last_ratio"] = float(ratio)
+        baseline_err = abs(int(estimated) - int(actual)) / max(int(actual), 1)
+        calibrated_est = max(1, int(int(estimated) * float(updated)))
+        calibrated_err = abs(calibrated_est - int(actual)) / max(int(actual), 1)
+
+        baseline_errors = entry.get("baseline_errors")
+        if not isinstance(baseline_errors, list):
+            baseline_errors = []
+            entry["baseline_errors"] = baseline_errors
+        baseline_errors.append(float(baseline_err))
+        if len(baseline_errors) > self._max_error_samples:
+            entry["baseline_errors"] = baseline_errors[-self._max_error_samples:]
+
+        calibrated_errors = entry.get("calibrated_errors")
+        if not isinstance(calibrated_errors, list):
+            calibrated_errors = []
+            entry["calibrated_errors"] = calibrated_errors
+        calibrated_errors.append(float(calibrated_err))
+        if len(calibrated_errors) > self._max_error_samples:
+            entry["calibrated_errors"] = calibrated_errors[-self._max_error_samples:]
+
+    def get_multiplier(self, model: str, *, estimated_input_tokens: int | None = None) -> float:
+        key = model or "unknown"
+        with self._lock:
+            data = self._by_model.get(key)
+            if not isinstance(data, dict):
+                return 1.0
+            overall = data.get("overall", {})
+            if not isinstance(overall, dict):
+                return 1.0
+            if estimated_input_tokens is None:
+                return float(overall.get("multiplier", 1.0))
+            bucket_key = self._bucket_key(int(estimated_input_tokens))
+            buckets = data.get("buckets", {})
+            if isinstance(buckets, dict):
+                entry = buckets.get(bucket_key)
+                if isinstance(entry, dict) and isinstance(entry.get("multiplier"), (int, float)):
+                    return float(entry.get("multiplier", 1.0))
+            return float(overall.get("multiplier", 1.0))
+
+    def record_sample(self, model: str, estimated_input_tokens: int, actual_input_tokens: int) -> None:
+        if estimated_input_tokens <= 0 or actual_input_tokens <= 0:
+            return
+        if estimated_input_tokens < self._min_estimated_input_tokens:
+            return
+
+        ratio = actual_input_tokens / max(estimated_input_tokens, 1)
+        if ratio < self._ratio_min:
+            ratio = self._ratio_min
+        elif ratio > self._ratio_max:
+            ratio = self._ratio_max
+
+        key = model or "unknown"
+        with self._lock:
+            model_data = self._ensure_model(key)
+            overall = model_data["overall"]
+            self._update_entry(overall, ratio, estimated_input_tokens, actual_input_tokens)
+            bucket_key = self._bucket_key(estimated_input_tokens)
+            buckets = model_data["buckets"]
+            entry = buckets.get(bucket_key)
+            if not isinstance(entry, dict):
+                entry = {
+                    "multiplier": 1.0,
+                    "samples": 0,
+                    "last_ratio": 1.0,
+                    "baseline_errors": [],
+                    "calibrated_errors": [],
+                }
+                buckets[bucket_key] = entry
+            self._update_entry(entry, ratio, estimated_input_tokens, actual_input_tokens)
+        self._persist_to_disk_if_needed()
+
+    def get_stats(self) -> dict[str, dict[str, float | int]]:
+        with self._lock:
+            out: dict[str, dict[str, float | int]] = {}
+            for model, data in self._by_model.items():
+                if not isinstance(data, dict):
+                    continue
+                overall = data.get("overall", {})
+                if not isinstance(overall, dict):
+                    continue
+                out[model] = {
+                    "multiplier": float(overall.get("multiplier", 1.0)),
+                    "samples": int(overall.get("samples", 0)),
+                    "last_ratio": float(overall.get("last_ratio", 1.0)),
+                }
+            return out
+
+    def get_bucket_stats(self) -> dict[str, dict[str, dict[str, float | int]]]:
+        with self._lock:
+            out: dict[str, dict[str, dict[str, float | int]]] = {}
+            for model, data in self._by_model.items():
+                if not isinstance(data, dict):
+                    continue
+                buckets = data.get("buckets", {})
+                if not isinstance(buckets, dict) or not buckets:
+                    continue
+                out_b: dict[str, dict[str, float | int]] = {}
+                for b, entry in buckets.items():
+                    if not isinstance(b, str) or not isinstance(entry, dict):
+                        continue
+                    out_b[b] = {
+                        "multiplier": float(entry.get("multiplier", 1.0)),
+                        "samples": int(entry.get("samples", 0)),
+                        "last_ratio": float(entry.get("last_ratio", 1.0)),
+                    }
+                if out_b:
+                    out[model] = out_b
+            return out
+
+    def get_error_stats(self) -> dict[str, dict[str, float | int]]:
+        def _pct(vals: list[float], p: float) -> float:
+            if not vals:
+                return 0.0
+            s = sorted(vals)
+            k = (len(s) - 1) * p
+            f = int(k)
+            c = min(f + 1, len(s) - 1)
+            if c == f:
+                return float(s[f])
+            return float(s[f] + (s[c] - s[f]) * (k - f))
+
+        with self._lock:
+            out: dict[str, dict[str, float | int]] = {}
+            for model, data in self._by_model.items():
+                if not isinstance(data, dict):
+                    continue
+                overall = data.get("overall", {})
+                if not isinstance(overall, dict):
+                    continue
+                baseline = overall.get("baseline_errors", [])
+                calibrated = overall.get("calibrated_errors", [])
+                baseline_vals = [float(e) for e in baseline if isinstance(e, (int, float))]
+                calibrated_vals = [float(e) for e in calibrated if isinstance(e, (int, float))]
+                if not baseline_vals and not calibrated_vals:
+                    continue
+                samples = int(overall.get("samples", 0))
+                baseline_p50 = _pct(baseline_vals, 0.50) if baseline_vals else 0.0
+                baseline_p95 = _pct(baseline_vals, 0.95) if baseline_vals else 0.0
+                baseline_mean = float(sum(baseline_vals) / len(baseline_vals)) if baseline_vals else 0.0
+                calibrated_p50 = _pct(calibrated_vals, 0.50) if calibrated_vals else 0.0
+                calibrated_p95 = _pct(calibrated_vals, 0.95) if calibrated_vals else 0.0
+                calibrated_mean = float(sum(calibrated_vals) / len(calibrated_vals)) if calibrated_vals else 0.0
+                out[model] = {
+                    "samples": samples,
+                    "baseline_error_p50": baseline_p50,
+                    "baseline_error_p95": baseline_p95,
+                    "baseline_error_mean": baseline_mean,
+                    "baseline_error_count": int(len(baseline_vals)),
+                    "calibrated_error_p50": calibrated_p50,
+                    "calibrated_error_p95": calibrated_p95,
+                    "calibrated_error_mean": calibrated_mean,
+                    "calibrated_error_count": int(len(calibrated_vals)),
+                    "error_p50": calibrated_p50,
+                    "error_p95": calibrated_p95,
+                    "error_mean": calibrated_mean,
+                    "error_count": int(len(calibrated_vals)),
+                }
+            return out
+
+    def get_bucket_error_stats(self) -> dict[str, dict[str, dict[str, float | int]]]:
+        def _pct(vals: list[float], p: float) -> float:
+            if not vals:
+                return 0.0
+            s = sorted(vals)
+            k = (len(s) - 1) * p
+            f = int(k)
+            c = min(f + 1, len(s) - 1)
+            if c == f:
+                return float(s[f])
+            return float(s[f] + (s[c] - s[f]) * (k - f))
+
+        with self._lock:
+            out: dict[str, dict[str, dict[str, float | int]]] = {}
+            for model, data in self._by_model.items():
+                if not isinstance(data, dict):
+                    continue
+                buckets = data.get("buckets", {})
+                if not isinstance(buckets, dict) or not buckets:
+                    continue
+                out_b: dict[str, dict[str, float | int]] = {}
+                for b, entry in buckets.items():
+                    if not isinstance(b, str) or not isinstance(entry, dict):
+                        continue
+                    baseline = entry.get("baseline_errors", [])
+                    calibrated = entry.get("calibrated_errors", [])
+                    baseline_vals = [float(e) for e in baseline if isinstance(e, (int, float))]
+                    calibrated_vals = [float(e) for e in calibrated if isinstance(e, (int, float))]
+                    if not baseline_vals and not calibrated_vals:
+                        continue
+                    baseline_p95 = _pct(baseline_vals, 0.95) if baseline_vals else 0.0
+                    calibrated_p95 = _pct(calibrated_vals, 0.95) if calibrated_vals else 0.0
+                    out_b[b] = {
+                        "samples": int(entry.get("samples", 0)),
+                        "baseline_error_p95": baseline_p95,
+                        "calibrated_error_p95": calibrated_p95,
+                    }
+                if out_b:
+                    out[model] = out_b
+            return out
+
+
+_token_estimation_calibrator = TokenEstimationCalibrator()
+
+
+def reset_token_estimation_calibration() -> None:
+    _token_estimation_calibrator.reset()
+
+
+def get_token_estimation_multiplier(model: str) -> float:
+    return _token_estimation_calibrator.get_multiplier(model)
+
+
+def get_token_estimation_multiplier_for_estimate(model: str, estimated_input_tokens: int) -> float:
+    return _token_estimation_calibrator.get_multiplier(model, estimated_input_tokens=estimated_input_tokens)
+
+
+def get_token_estimation_calibration_stats() -> dict[str, dict[str, float | int]]:
+    return _token_estimation_calibrator.get_stats()
+
+
+def get_token_estimation_error_stats() -> dict[str, dict[str, float | int]]:
+    return _token_estimation_calibrator.get_error_stats()
+
+def get_token_estimation_bucket_stats() -> dict[str, dict[str, dict[str, float | int]]]:
+    return _token_estimation_calibrator.get_bucket_stats()
+
+
+def get_token_estimation_bucket_error_stats() -> dict[str, dict[str, dict[str, float | int]]]:
+    return _token_estimation_calibrator.get_bucket_error_stats()
+
+
+def record_token_estimation_sample(model: str, estimated_input_tokens: int, actual_input_tokens: int) -> None:
+    _token_estimation_calibrator.record_sample(model, estimated_input_tokens, actual_input_tokens)
+
+
+def apply_token_estimation_multiplier(tokens: int, model: str) -> int:
+    if tokens <= 0:
+        return 0
+    multiplier = get_token_estimation_multiplier_for_estimate(model, tokens)
+    return max(1, int(tokens * multiplier))
+
+
 def estimate_tokens(text: str) -> int:
+    global _token_cache_hits, _token_cache_misses, _token_cache_sets, _token_cache_evictions
     """改进的 token 估算，支持中英文
     
     - 英文/代码：约 4 字符/token
@@ -87,11 +543,14 @@ def estimate_tokens(text: str) -> int:
     if not text:
         return 0
     
-    # 缓存查找（短文本优先缓存）
-    cache_key = text if len(text) < 256 else hash(text)  # 长文本用 hash 作为 key
-    cached = _token_cache.get(cache_key)
-    if cached is not None:
-        return cached
+    cache_key = _make_token_cache_key(text)
+    with _token_cache_lock:
+        cached = _token_cache.get(cache_key)
+        if cached is not None:
+            _token_cache_hits += 1
+            _token_cache.move_to_end(cache_key)
+            return cached
+        _token_cache_misses += 1
     
     # 使用正则表达式快速统计 CJK 字符数量
     cjk_count = len(_CJK_PATTERN.findall(text))
@@ -101,9 +560,13 @@ def estimate_tokens(text: str) -> int:
     
     result = max(1, int(cjk_count / 1.5 + ascii_chars / 4.0))
     
-    # 缓存结果（防止无限增长）
-    if len(_token_cache) < _TOKEN_CACHE_MAX:
+    with _token_cache_lock:
+        _token_cache_sets += 1
         _token_cache[cache_key] = result
+        _token_cache.move_to_end(cache_key)
+        while len(_token_cache) > _TOKEN_CACHE_MAX:
+            _token_cache.popitem(last=False)
+            _token_cache_evictions += 1
     
     return result
 
@@ -464,7 +927,11 @@ class ContextManager:
             
             if msg.get("role") == "assistant_tool_call":
                 tool_calls += 1
-        
+
+        base_total_tokens = system_tokens + conversation_tokens
+        multiplier = get_token_estimation_multiplier_for_estimate(self.model, base_total_tokens)
+        system_tokens = int(system_tokens * multiplier)
+        conversation_tokens = int(conversation_tokens * multiplier)
         total_tokens = system_tokens + conversation_tokens
         usage_pct = (total_tokens / self.context_window * 100) if self.context_window > 0 else 0
         
