@@ -1,4 +1,4 @@
-# MiniCode Python
+# Mini-Coding
 
 <p align="center">
   <strong>一个运行在终端中的本地编码 AI Agent。</strong>
@@ -9,7 +9,7 @@
   <img alt="License" src="https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square">
 </p>
 
-MiniCode Python 是一个运行在终端中的编码助手 Agent。它能自动管理上下文窗口、记忆检索、成本追踪和故障恢复，让你在本地开发中专注于编码本身。
+Mini-Coding是一个运行在终端中的编码助手 Agent。它能自动管理上下文窗口、记忆检索、成本追踪和故障恢复，让你在本地开发中专注于编码本身。
 
 ---
 
