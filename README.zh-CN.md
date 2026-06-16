@@ -117,32 +117,32 @@ flowchart TB
 sequenceDiagram
     participant User as 用户
     participant CLI as main.py
-    participant Loop as agent_loop.py
+    participant Agent as agent_loop.py
     participant Cyber as 控制论引擎
     participant Mem as 记忆系统
     participant Tools as 工具系统
     participant LLM as LLM Model
 
     User->>CLI: 输入自然语言指令
-    CLI->>Loop: 解析参数，初始化运行时
+    CLI->>Agent: 解析参数，初始化运行时
 
-    Loop->>Mem: 检索相关记忆
-    Mem-->>Loop: 返回项目记忆片段
+    Agent->>Mem: 检索相关记忆
+    Mem-->>Agent: 返回项目记忆片段
 
-    Loop->>Cyber: step_start() 通知
-    Cyber-->>Loop: 返回运行时动作（压缩、预算等）
+    Agent->>Cyber: step_start() 通知
+    Cyber-->>Agent: 返回运行时动作（压缩、预算等）
 
-    Loop->>LLM: 构建 Prompt（系统提示 + 记忆 + 上下文 + 用户输入）
-    LLM-->>Loop: 返回响应（文本 + 工具调用）
+    Agent->>LLM: 构建 Prompt（系统提示 + 记忆 + 上下文 + 用户输入）
+    LLM-->>Agent: 返回响应（文本 + 工具调用）
 
-    Loop->>Tools: 执行工具调用
-    Tools-->>Loop: 返回工具结果
+    Agent->>Tools: 执行工具调用
+    Tools-->>Agent: 返回工具结果
 
-    Loop->>Cyber: step_end() 反馈
-    Cyber-->>Loop: 更新控制器状态
+    Agent->>Cyber: step_end() 反馈
+    Cyber-->>Agent: 更新控制器状态
 
-    Loop->>Mem: 更新记忆
-    Loop->>CLI: 输出结果给用户
+    Agent->>Mem: 更新记忆
+    Agent->>CLI: 输出结果给用户
     CLI->>User: 显示响应
 ```
 
